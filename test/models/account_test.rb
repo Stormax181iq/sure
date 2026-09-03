@@ -420,6 +420,230 @@ class AccountTest < ActiveSupport::TestCase
     assert_not ActiveStorage::Attachment.exists?(attachment_id)
   end
 
+  # Logo URL tests
+  test "logo_url returns Brandfetch URL when configured" do
+    Setting.stubs(:brand_fetch_client_id).returns("test_client_id")
+    Setting.stubs(:brand_fetch_logo_size).returns(120)
+    @account.institution_domain = "example.com"
+
+    expected_url = "https://cdn.brandfetch.io/example.com/icon/fallback/lettermark/w/120/h/120?c=test_client_id"
+    assert_equal expected_url, @account.logo_url
+  end
+
+  test "logo_url returns DuckDuckGo favicon when Brandfetch not configured" do
+    Setting.stubs(:brand_fetch_client_id).returns(nil)
+    @account.institution_domain = "example.com"
+
+    expected_url = "https://icons.duckduckgo.com/ip3/example.com.ico"
+    assert_equal expected_url, @account.logo_url
+  end
+
+  test "logo_url returns provider logo when available" do
+    Setting.stubs(:brand_fetch_client_id).returns(nil)
+    @account.institution_domain = nil
+    provider = OpenStruct.new(logo_url: "https://provider.com/logo.png")
+    @account.stubs(:provider).returns(provider)
+
+    assert_equal "https://provider.com/logo.png", @account.logo_url
+  end
+
+  test "logo_url prefers provider logo over favicon fallback" do
+    Setting.stubs(:brand_fetch_client_id).returns(nil)
+    @account.institution_domain = "example.com"
+    provider = OpenStruct.new(logo_url: "https://provider.com/logo.png")
+    @account.stubs(:provider).returns(provider)
+
+    assert_equal "https://provider.com/logo.png", @account.logo_url
+  end
+
+  test "logo_url returns attached logo URL when manual source" do
+    Setting.stubs(:brand_fetch_client_id).returns(nil)
+    @account.institution_domain = nil
+    @account.logo.attach(
+      io: StringIO.new("fake-logo"),
+      filename: "logo.png",
+      content_type: "image/png"
+    )
+    @account.logo_source = "manual"
+
+    assert @account.logo_url.include?("/rails/active_storage")
+  end
+
+  test "logo_url returns nil when no logo source available" do
+    Setting.stubs(:brand_fetch_client_id).returns(nil)
+    @account.institution_domain = nil
+    @account.stubs(:provider).returns(nil)
+
+    assert_nil @account.logo_url
+  end
+
+  # Favicon URL tests
+  test "favicon_url returns DuckDuckGo URL" do
+    @account.institution_domain = "example.com"
+    expected_url = "https://icons.duckduckgo.com/ip3/example.com.ico"
+    assert_equal expected_url, @account.favicon_url
+  end
+
+  test "favicon_url returns nil when no domain" do
+    @account.institution_domain = nil
+    assert_nil @account.favicon_url
+  end
+
+  # Domain cleaning tests
+  test "clean_institution_domain removes https://" do
+    @account.institution_domain = "https://example.com"
+    @account.valid?
+    assert_equal "example.com", @account.institution_domain
+  end
+
+  test "clean_institution_domain removes www." do
+    @account.institution_domain = "www.example.com"
+    @account.valid?
+    assert_equal "example.com", @account.institution_domain
+  end
+
+  test "clean_institution_domain removes path" do
+    @account.institution_domain = "example.com/some/path"
+    @account.valid?
+    assert_equal "example.com", @account.institution_domain
+  end
+
+  test "clean_institution_domain removes port" do
+    @account.institution_domain = "example.com:8080"
+    @account.valid?
+    assert_equal "example.com", @account.institution_domain
+  end
+
+  test "clean_institution_domain handles complex URLs" do
+    @account.institution_domain = "https://www.example.com:8080/some/path"
+    @account.valid?
+    assert_equal "example.com", @account.institution_domain
+  end
+
+  # Logo source enum tests
+  test "logo_source defaults to auto" do
+    assert_equal "auto", @account.logo_source
+  end
+
+  test "logo_source can be set to manual" do
+    @account.logo_source = "manual"
+    assert_equal "manual", @account.logo_source
+  end
+
+  test "logo_source is auto?" do
+    assert @account.logo_source_auto?
+  end
+
+  test "logo_source is manual?" do
+    @account.logo_source = "manual"
+    assert @account.logo_source_manual?
+  end
+
+  test "uploading a logo without an explicit logo_source marks it manual" do
+    # Simulates a caller that submits a logo without choosing a source. The
+    # enum defaults logo_source to "auto", which previously swallowed
+    # set_logo_source and later let FetchLogoJob replace the upload with an
+    # institution logo.
+    @account.update!(
+      logo: { io: StringIO.new("user-upload"), filename: "logo.png", content_type: "image/png" }
+    )
+
+    assert @account.logo_source_manual?
+  end
+
+  test "saving without an upload leaves an existing logo_source untouched" do
+    # The auto fetcher attaches through attach_fetched_logo, so a plain save
+    # on an account with a fetched logo must not flip it to manual.
+    @account.attach_fetched_logo(
+      io: StringIO.new("fetched-logo"),
+      filename: "fetched.png",
+      content_type: "image/png"
+    )
+    @account.reload
+
+    @account.update!(notes: "changed")
+
+    assert @account.logo_source_auto?
+  end
+
+  test "rejects logo uploads with non-image content types" do
+    # The form's accept="image/*" is client-side only; a crafted request can
+    # submit anything, so the model enforces the content type too.
+    @account.logo.attach(
+      io: StringIO.new("<html><body>not an image</body></html>"),
+      filename: "page.html",
+      content_type: "text/html"
+    )
+
+    assert_not @account.valid?
+    assert @account.errors[:logo].present?
+  end
+
+  test "rejects logo uploads larger than the size limit" do
+    @account.logo.attach(
+      io: StringIO.new("x" * (Account::MAX_LOGO_BYTES + 1)),
+      filename: "huge.png",
+      content_type: "image/png"
+    )
+
+    assert_not @account.valid?
+    assert @account.errors[:logo].present?
+  end
+
+  test "accepts logo uploads with an image content type" do
+    @account.logo.attach(
+      io: StringIO.new("valid-image"),
+      filename: "logo.png",
+      content_type: "image/png"
+    )
+
+    assert @account.valid?
+  end
+
+  test "changing the domain purges the previously fetched logo" do
+    @account.update!(institution_domain: "old.example.com", logo_source: "auto")
+    @account.attach_fetched_logo(
+      io: StringIO.new("old-logo"),
+      filename: "old.png",
+      content_type: "image/png"
+    )
+    @account.reload
+    assert @account.logo.attached?
+
+    @account.update!(institution_domain: "new.example.com")
+
+    assert_not @account.reload.logo.attached?
+  end
+
+  test "a failed fetch after a domain change serves the new domain fallback, not the old logo" do
+    Setting.stubs(:brand_fetch_client_id).returns(nil)
+
+    @account.update!(institution_domain: "old.example.com", logo_source: "auto")
+    @account.attach_fetched_logo(
+      io: StringIO.new("old-logo"),
+      filename: "old.png",
+      content_type: "image/png"
+    )
+
+    # Mock DNS resolution for DuckDuckGo
+    Resolv.stubs(:getaddresses).with("icons.duckduckgo.com").returns([ "52.149.246.247" ])
+
+    ddg_failure = Net::HTTPNotFound.new("1.1", "404", "Not Found")
+    ddg_failure.stubs(:body).returns(nil)
+    ddg_http = mock
+    ddg_http.stubs(:use_ssl=)
+    ddg_http.stubs(:open_timeout=)
+    ddg_http.stubs(:read_timeout=)
+    ddg_http.expects(:request).returns(ddg_failure)
+    Net::HTTP.stubs(:new).with("icons.duckduckgo.com", 443).returns(ddg_http)
+
+    @account.update!(institution_domain: "new.example.com")
+    FetchLogoJob.perform_now(@account.id, "new.example.com")
+
+    assert_not @account.logo.attached?
+    assert_equal "https://icons.duckduckgo.com/ip3/new.example.com.ico", @account.logo_url
+  end
+
   test "destroying account moves linked statements to inbox after commit" do
     statement = AccountStatement.create_from_upload!(
       family: @family,
@@ -678,5 +902,105 @@ class AccountTest < ActiveSupport::TestCase
 
     assert_empty queries.grep(/SELECT "transactions"\.\* FROM "transactions" WHERE "transactions"\."id" =/)
     assert transfers.all? { |transfer| !Transfer.exists?(transfer.id) }
+  end
+
+  test "manual logo source displays the attached logo" do
+    # When logo_source is "manual", the uploaded logo should be displayed
+    logo_file = uploaded_file(filename: "test_logo.png", content_type: "image/png", content: "valid-image-data")
+
+    account = Account.create_and_sync(
+      {
+        family: @family,
+        owner: @admin,
+        name: "Test8",
+        balance: 1000,
+        currency: "USD",
+        accountable_type: "Depository",
+        accountable_attributes: {},
+        logo: logo_file,
+        logo_source: "manual"
+      },
+      skip_initial_sync: true
+    )
+
+    assert account.persisted?, "Account should be created successfully"
+    assert account.logo.attached?, "Logo should be attached to the account"
+    assert account.logo_source_manual?, "Logo source should be manual"
+
+    # logo_url should return the attached logo URL
+    logo_url = account.logo_url
+    assert logo_url.present?, "logo_url should be present when logo is attached with manual source"
+
+    # Verify it's the blob URL
+    assert logo_url.include?("/rails/active_storage/"), "logo_url should be an Active Storage blob URL"
+  end
+
+  test "auto logo source uses an attached fetched logo" do
+    # When logo_source is "auto", a logo successfully attached by LogoFetcher
+    # should be served before falling back to remote logo providers.
+    logo_file = uploaded_file(
+      filename: "test_logo.png",
+      content_type: "image/png",
+      content: "valid-image-data"
+    )
+
+    account = Account.create_and_sync(
+      {
+        family: @family,
+        owner: @admin,
+        name: "Test Auto Account",
+        balance: 1000,
+        currency: "USD",
+        accountable_type: "Depository",
+        accountable_attributes: {},
+        institution_domain: "example.com",
+        logo: logo_file,
+        logo_source: "auto"
+      },
+      skip_initial_sync: true
+    )
+
+    assert account.persisted?, "Account should be created successfully"
+    assert account.logo.attached?, "Logo should be attached to the account"
+    assert account.logo_source_auto?, "Logo source should be auto"
+
+    # An attached fetched logo should take priority over remote fallbacks.
+    logo_url = account.logo_url
+
+    assert logo_url.present?, "logo_url should be present"
+    assert logo_url.include?("/rails/active_storage/"),
+      "logo_url should be the attached blob URL"
+  end
+
+  test "manual logo source falls back to auto-fetch when no logo attached" do
+    # When logo_source is "manual" but no logo is attached, should fallback
+    account = Account.create_and_sync(
+      {
+        family: @family,
+        owner: @admin,
+        name: "Test Manual No Logo",
+        balance: 1000,
+        currency: "USD",
+        accountable_type: "Depository",
+        accountable_attributes: {},
+        institution_domain: "example.com",
+        logo_source: "manual"
+      },
+      skip_initial_sync: true
+    )
+
+    assert account.persisted?, "Account should be created successfully"
+    assert_not account.logo.attached?, "Logo should not be attached"
+    assert account.logo_source_manual?, "Logo source should be manual"
+
+    # logo_url should return the auto-fetch fallback
+    logo_url = account.logo_url
+    assert logo_url.present?, "logo_url should be present even without attached logo"
+  end
+
+  test "clean_institution_domain removes uppercase https scheme" do
+    @account.institution_domain = "HTTPS://WWW.EXAMPLE.COM/path"
+    @account.valid?
+    assert_equal "example.com", @account.institution_domain
   end
 end
